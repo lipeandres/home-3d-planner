@@ -9,6 +9,7 @@ Third-party software (loaded at run time from public CDNs, not copied into this 
   three.js            MIT            Copyright 2010-2024 three.js authors       https://threejs.org
   three-mesh-bvh      MIT            Copyright 2018 Garrett Johnson             https://github.com/gkjohnson/three-mesh-bvh
   Pyodide             MPL-2.0        Copyright Pyodide contributors             https://pyodide.org
+  fflate              MIT            Copyright 2023 Arjun Barrett               https://github.com/101arrowz/fflate
   NumPy               BSD-3-Clause   Copyright NumPy Developers                 https://numpy.org
   SciPy               BSD-3-Clause   Copyright SciPy Developers                 https://scipy.org
 

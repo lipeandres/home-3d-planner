@@ -139,7 +139,7 @@
 </head>
 <body>
 <div id="cleanBar" hidden><span id="cleanMsg"></span><button id="cleanRetry" hidden data-i18n="cleanRetry"></button></div>
-<input id="scanFile" type="file" accept=".glb,model/gltf-binary" hidden>
+<input id="scanFile" type="file" accept=".glb,.gltf,.zip,.bin,image/*" multiple hidden>
 <input id="bkFile" type="file" accept="application/json" hidden>
 <div id="loading"><span data-i18n="loading"></span> <span id="pct" style="margin-left:8px"></span></div>
 <div id="vbar">
@@ -296,6 +296,7 @@
       <li><a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> (MIT) © three.js authors</li>
       <li><a href="https://github.com/gkjohnson/three-mesh-bvh" target="_blank" rel="noopener">three-mesh-bvh</a> (MIT) © Garrett Johnson</li>
       <li><a href="https://pyodide.org" target="_blank" rel="noopener">Pyodide</a> (MPL-2.0) © Pyodide contributors</li>
+      <li><a href="https://github.com/101arrowz/fflate" target="_blank" rel="noopener">fflate</a> (MIT) © Arjun Barrett</li>
       <li><a href="https://numpy.org" target="_blank" rel="noopener">NumPy</a> (BSD-3-Clause) © NumPy Developers</li>
       <li><a href="https://scipy.org" target="_blank" rel="noopener">SciPy</a> (BSD-3-Clause) © SciPy Developers</li>
     </ul></details>
@@ -383,30 +384,80 @@ async function idbRun(mode, fn) {
 const scanList = () => idbRun('readonly', s => s.getAll());
 const scanPut = r => idbRun('readwrite', s => s.put(r));
 const scanDel = k => idbRun('readwrite', s => s.delete(k));
-async function importScan(file) {                 // validates a .glb, stores it, makes it the active scan
+// A scan can be a .glb, a .gltf (alone with embedded data, or with its .bin and textures), or a .zip holding either (Polycam's free glTF export).
+// Everything is repacked into one in-memory .glb, which is what the viewer and tools/flatten.py read.
+async function toGlb(files) {
+  files = [...files];
+  const ext = n => (n.match(/\.([^.\/]+)$/) || [])[1]?.toLowerCase();
+  const first = files[0];
+  if (files.length === 1 && ext(first.name) === 'glb') return first;
+  const entries = new Map();                                       // path inside the zip / file name -> Blob
+  if (files.length === 1 && ext(first.name) === 'zip') {
+    const { unzipSync } = await import('https://cdn.jsdelivr.net/npm/fflate@0.8.2/esm/browser.js');
+    const z = unzipSync(new Uint8Array(await first.arrayBuffer()));
+    for (const [path, data] of Object.entries(z)) if (!path.endsWith('/') && !path.startsWith('__MACOSX/')) entries.set(path, new Blob([data]));
+  } else files.forEach(f => entries.set(f.name, f));
+  const paths = [...entries.keys()].sort((x, y) => x.length - y.length);
+  const base = first.name.replace(/\.[^.]+$/, '');
+  const glbPath = paths.find(x => ext(x) === 'glb');
+  if (glbPath) return new File([entries.get(glbPath)], base + '.glb', { lastModified: first.lastModified });
+  const mainPath = paths.find(x => ext(x) === 'gltf');
+  if (!mainPath) throw new Error('no .glb or .gltf found');
+  const dir = mainPath.includes('/') ? mainPath.slice(0, mainPath.lastIndexOf('/') + 1) : '';
+  const gj = JSON.parse(await entries.get(mainPath).text());
+  const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
+  const getUri = async uri => {
+    if (uri.startsWith('data:')) { const i = uri.indexOf(','), body = uri.slice(i + 1); return /;base64$/.test(uri.slice(0, i)) ? Uint8Array.from(atob(body), c => c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(body)); }
+    const key = decodeURIComponent(uri.split(/[?#]/)[0]).replace(/^\.\//, '');
+    const hit = entries.get(dir + key) || entries.get(key) || [...entries].find(([p]) => p.toLowerCase().endsWith('/' + key.toLowerCase()) || p.toLowerCase() === key.toLowerCase())?.[1];
+    if (!hit) throw new Error('missing file: ' + uri);
+    return new Uint8Array(await hit.arrayBuffer());
+  };
+  const chunks = []; let total = 0;
+  const add = data => { const off = total; chunks.push(data); total += data.length; const pad = (4 - total % 4) % 4; if (pad) { chunks.push(new Uint8Array(pad)); total += pad; } return off; };
+  const bufOff = [];
+  for (const b of gj.buffers || []) { if (!b.uri) throw new Error('buffer without data'); bufOff.push(add(await getUri(b.uri))); }
+  for (const bv of gj.bufferViews || []) { bv.byteOffset = (bv.byteOffset || 0) + bufOff[bv.buffer]; bv.buffer = 0; }
+  for (const im of gj.images || []) if (im.uri) {
+    const d = await getUri(im.uri);
+    im.mimeType = im.mimeType || (im.uri.startsWith('data:') ? im.uri.slice(5, im.uri.indexOf(';')) : MIME[ext(im.uri.split(/[?#]/)[0])]) || (d[0] === 0x89 ? 'image/png' : 'image/jpeg');
+    (gj.bufferViews ||= []).push({ buffer: 0, byteOffset: add(d), byteLength: d.length }); im.bufferView = gj.bufferViews.length - 1; delete im.uri;
+  }
+  gj.buffers = [{ byteLength: total }];
+  const json = new TextEncoder().encode(JSON.stringify(gj)), jlen = json.length + (4 - json.length % 4) % 4;
+  const out = new Uint8Array(20 + jlen + 8 + total), dv = new DataView(out.buffer);
+  dv.setUint32(0, 0x46546C67, true); dv.setUint32(4, 2, true); dv.setUint32(8, out.length, true);
+  dv.setUint32(12, jlen, true); dv.setUint32(16, 0x4E4F534A, true); out.set(json, 20); out.fill(0x20, 20 + json.length, 20 + jlen);
+  let o = 20 + jlen; dv.setUint32(o, total, true); dv.setUint32(o + 4, 0x004E4942, true); o += 8;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return new File([out], base + '.glb', { lastModified: first.lastModified });
+}
+async function importScan(files) {                 // converts to .glb if needed, stores it, makes it the active scan
+  files = [...files]; const src = files[0];
+  const file = await toGlb(files);
   const head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
-  if (String.fromCharCode(...head) !== 'glTF') throw new Error('not a .glb file');
-  let h = 0; for (const c of `${file.name}|${file.size}|${file.lastModified}`) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  const rec = { key: 's' + h.toString(36), name: file.name.replace(/\.glb$/i, '').slice(0, 60), blob: file, added: Date.now(), clean: null };
+  if (String.fromCharCode(...head) !== 'glTF') throw new Error('not a glTF file');
+  let h = 0; for (const c of `${src.name}|${src.size}|${src.lastModified}`) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  const rec = { key: 's' + h.toString(36), name: src.name.replace(/\.(glb|gltf|zip)$/i, '').slice(0, 60), blob: file, added: Date.now(), clean: null };
   try { const old = (await scanList()).find(x => x.key === rec.key); if (old) rec.clean = old.clean; await scanPut(rec); } catch {}
   try { localStorage.setItem('home3d-active', rec.key); } catch {}
   return rec;
 }
 const WEL = {
-  en: { p: 'Explore a 3D scan of a house in your browser, check how furniture fits and try out colours and finishes.', how: 'Export your scan as a .glb file (for example from Polycam) and open it here. The scan stays on this device: it is never uploaded.', pick: 'Choose a .glb scan', drop: 'or drop the file here', bad: 'That does not look like a .glb file.' },
-  'pt-BR': { p: 'Explore o scan 3D de uma casa no navegador, veja como os móveis cabem e teste cores e acabamentos.', how: 'Exporte o scan como arquivo .glb (por exemplo, do Polycam) e abra aqui. O scan fica neste dispositivo: nunca é enviado para a internet.', pick: 'Escolher um scan .glb', drop: 'ou arraste o arquivo para cá', bad: 'Isso não parece ser um arquivo .glb.' },
-  'es-419': { p: 'Explora el escaneo 3D de una casa en el navegador, comprueba cómo caben los muebles y prueba colores y acabados.', how: 'Exporta tu escaneo como archivo .glb (por ejemplo, desde Polycam) y ábrelo aquí. El escaneo se queda en este dispositivo: nunca se sube a internet.', pick: 'Elegir un escaneo .glb', drop: 'o suelta el archivo aquí', bad: 'Eso no parece un archivo .glb.' },
+  en: { p: 'Explore a 3D scan of a house in your browser, check how furniture fits and try out colours and finishes.', how: 'Export your scan as a .glb or glTF (.zip) file (for example from Polycam) and open it here. The scan stays on this device: it is never uploaded.', pick: 'Choose a scan (.glb, .gltf or .zip)', drop: 'or drop the file here', bad: 'Could not read that file. Use a .glb, a .gltf with its files, or the .zip exported by Polycam.' },
+  'pt-BR': { p: 'Explore o scan 3D de uma casa no navegador, veja como os móveis cabem e teste cores e acabamentos.', how: 'Exporte o scan como .glb ou glTF (.zip) (por exemplo, do Polycam) e abra aqui. O scan fica neste dispositivo: nunca é enviado para a internet.', pick: 'Escolher um scan (.glb, .gltf ou .zip)', drop: 'ou arraste o arquivo para cá', bad: 'Não foi possível ler esse arquivo. Use um .glb, um .gltf com seus arquivos ou o .zip exportado pelo Polycam.' },
+  'es-419': { p: 'Explora el escaneo 3D de una casa en el navegador, comprueba cómo caben los muebles y prueba colores y acabados.', how: 'Exporta tu escaneo como .glb o glTF (.zip) (por ejemplo, desde Polycam) y ábrelo aquí. El escaneo se queda en este dispositivo: nunca se sube a internet.', pick: 'Elegir un escaneo (.glb, .gltf o .zip)', drop: 'o suelta el archivo aquí', bad: 'No se pudo leer ese archivo. Usa un .glb, un .gltf con sus archivos o el .zip exportado por Polycam.' },
 };
 function welcome() {                              // first visit: ask for a scan; resolves with the stored record
   return new Promise(ok => {
     let lg = 'en'; try { lg = localStorage.getItem('home3d-lang'); } catch {}
     if (!(lg in WEL)) lg = /^pt/i.test(navigator.language) ? 'pt-BR' : /^es/i.test(navigator.language) ? 'es-419' : 'en';
     const L = WEL[lg], el = document.createElement('div'); el.id = 'welcome';
-    el.innerHTML = '<div class="wbox"><h1>Home 3D Planner</h1><p class="w1"></p><p class="w2 dim"></p><label class="wpick"><input type="file" accept=".glb,model/gltf-binary" hidden><span class="w3"></span></label><div class="dim w4"></div><div class="werr"></div></div>';
+    el.innerHTML = '<div class="wbox"><h1>Home 3D Planner</h1><p class="w1"></p><p class="w2 dim"></p><label class="wpick"><input type="file" accept=".glb,.gltf,.zip,.bin,image/*" multiple hidden><span class="w3"></span></label><div class="dim w4"></div><div class="werr"></div></div>';
     el.querySelector('.w1').textContent = L.p; el.querySelector('.w2').textContent = L.how; el.querySelector('.w3').textContent = L.pick; el.querySelector('.w4').textContent = L.drop;
-    const take = async f => { if (!f) return; try { const r = await importScan(f); el.remove(); ok(r); } catch { el.querySelector('.werr').textContent = L.bad; } };
-    el.querySelector('input').onchange = e => take(e.target.files[0]);
-    el.ondragover = e => e.preventDefault(); el.ondrop = e => { e.preventDefault(); take(e.dataTransfer.files[0]); };
+    const take = async fs => { if (!fs || !fs.length) return; try { const r = await importScan(fs); el.remove(); ok(r); } catch (err) { console.warn(err); el.querySelector('.werr').textContent = L.bad; } };
+    el.querySelector('input').onchange = e => take(e.target.files);
+    el.ondragover = e => e.preventDefault(); el.ondrop = e => { e.preventDefault(); take(e.dataTransfer.files); };
     document.body.appendChild(el);
   });
 }
@@ -1835,7 +1886,7 @@ function saveEdits() {                                  // call after any change
 // ---- scans and backups (all data stays in this browser) ----
 const isMine = k => k.startsWith('home3d-') && (k.endsWith('-' + modelKey) || k.includes('-' + modelKey + '.'));
 $('scanAdd').onclick = () => $('scanFile').click();
-$('scanFile').onchange = async e => { const f = e.target.files[0]; e.target.value = ''; if (!f) return; try { await importScan(f); location.reload(); } catch { alert(WEL[lang in WEL ? lang : 'en'].bad); } };
+$('scanFile').onchange = async e => { const fs = [...e.target.files]; e.target.value = ''; if (!fs.length) return; try { await importScan(fs); location.reload(); } catch { alert(WEL[lang in WEL ? lang : 'en'].bad); } };
 $('scanDel').onclick = async () => {
   if (!confirm(t('confirmRemoveScan'))) return;
   try { await scanDel(modelKey); } catch {}
