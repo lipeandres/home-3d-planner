@@ -1,0 +1,15 @@
+Home 3D Planner
+Copyright 2026 Felipe Navarro Murcia
+
+This product was created by Felipe Navarro Murcia (https://github.com/lipeandres).
+Licensed under the Apache License, Version 2.0 (see LICENSE). If you redistribute or
+build on this work, keep this NOTICE file and the "Created by" credit in the app.
+
+Third-party software (loaded at run time from public CDNs, not copied into this repository):
+  three.js            MIT            Copyright 2010-2024 three.js authors       https://threejs.org
+  three-mesh-bvh      MIT            Copyright 2018 Garrett Johnson             https://github.com/gkjohnson/three-mesh-bvh
+  Pyodide             MPL-2.0        Copyright Pyodide contributors             https://pyodide.org
+  NumPy               BSD-3-Clause   Copyright NumPy Developers                 https://numpy.org
+  SciPy               BSD-3-Clause   Copyright SciPy Developers                 https://scipy.org
+
+Not affiliated with or endorsed by Polycam. Polycam is a trademark of its owner.
